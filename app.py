@@ -28,7 +28,7 @@ import os
 import requests
 from flask import Flask, jsonify, request
 
-import lakebase
+from lakebase import run_query, get_connection
 from weather_client import WeatherClient
 
 
@@ -418,6 +418,127 @@ def _upsert_weather_batch(
             conn.commit()
 
     return count
+
+@app.route("/weather/search", methods=["POST"])
+def search_weather():
+    """
+    Semantic search over weather documents using pgvector cosine similarity.
+
+    Request:
+    {
+        "query": "risk of flooding near rivers",
+        "top_k": 5
+    }
+    """
+
+    data = request.get_json(silent=True) or {}
+
+    query = data.get("query")
+
+    if not isinstance(query, str) or not query.strip():
+        return jsonify({
+            "error": "query must be a non-empty string"
+        }), 400
+
+    query = query.strip()
+
+    try:
+        top_k = int(data.get("top_k", 5))
+    except (TypeError, ValueError):
+        return jsonify({
+            "error": "top_k must be an integer"
+        }), 400
+
+    # Clamp top_k to 1–20
+    top_k = max(1, min(top_k, 20))
+
+    try:
+        # ----------------------------------------------------------
+        # Generate query embedding
+        # ----------------------------------------------------------
+
+        query_embedding = embedding_model.encode(
+            query,
+            normalize_embeddings=True
+        )
+
+        # Convert numpy array to pgvector array literal
+        vector_string = (
+            "["
+            + ",".join(
+                str(float(value))
+                for value in query_embedding
+            )
+            + "]"
+        )
+
+        # ----------------------------------------------------------
+        # Semantic search
+        # ----------------------------------------------------------
+
+        sql = """
+            SELECT
+                d.id,
+                d.location,
+                d.title,
+                d.narrative_text,
+                e.chunk_text,
+                1 - (
+                    e.embedding <=> %s::vector
+                ) AS similarity
+            FROM weather_embeddings e
+            JOIN weather_documents d
+                ON d.id = e.document_id
+            ORDER BY
+                e.embedding <=> %s::vector
+            LIMIT %s;
+        """
+
+        rows = run_query(
+            sql,
+            (
+                vector_string,
+                vector_string,
+                top_k,
+            )
+        )
+
+        # ----------------------------------------------------------
+        # Return results
+        # ----------------------------------------------------------
+
+        results = []
+
+        for row in rows:
+            results.append({
+                "id": row["id"],
+                "location": row["location"],
+                "title": row["headline"],
+                "narrative_text": row["narrative_text"],
+                "chunk_text": row["chunk_text"],
+                "similarity": float(
+                    row["similarity"]
+                ),
+            })
+
+        return jsonify({
+            "query": query,
+            "top_k": top_k,
+            "count": len(results),
+            "results": results,
+        })
+
+    except Exception as exc:
+
+        app.logger.exception(
+            "Weather semantic search failed"
+        )
+
+        return jsonify({
+            "error": "Weather search failed",
+            "details": str(exc),
+        }), 500
+
 
 
 # =====================================================================
